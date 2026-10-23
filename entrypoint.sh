@@ -175,6 +175,38 @@ backup() {
   echo "Backup completed: ${S3_OBJECT_KEY}"
 }
 
+# Probe owner/repo on the target and set ACTION to one of:
+#   create     repo is missing: create it, then push
+#   push       repo exists but is empty: push (counted as created)
+#   overwrite  repo has content and RESTORE_OVERWRITE_EXISTING=true: push --mirror
+#   skip       repo has content and overwrite is not requested
+#   fail       the repo could not be probed (an ERROR line has been printed)
+decide_repo_action() {
+  local owner="$1" repo="$2" body code empty
+  body=$(mktemp)
+  code=$(curl -s -o "$body" -w "%{http_code}" \
+    -H "Authorization: Bearer ${GITEA_TOKEN}" \
+    "${GITEA_URL}/api/v1/repos/${owner}/${repo}" || true)
+  ACTION=fail
+  if [ "$code" = "404" ]; then
+    ACTION=create
+  elif [ "$code" = "200" ] && jq -e . "$body" >/dev/null 2>&1; then
+    empty=$(jq -r '.empty' "$body")
+    if [ "$empty" = "true" ]; then
+      ACTION=push
+    elif [ "${RESTORE_OVERWRITE_EXISTING:-}" = "true" ]; then
+      echo "WARN: overwriting ${owner}/${repo} (RESTORE_OVERWRITE_EXISTING=true)"
+      ACTION=overwrite
+    else
+      echo "SKIP: ${owner}/${repo} already exists with content (set RESTORE_OVERWRITE_EXISTING=true to overwrite)"
+      ACTION=skip
+    fi
+  else
+    echo "ERROR: cannot probe ${owner}/${repo} (HTTP ${code:-000})"
+  fi
+  rm -f "$body"
+}
+
 restore() {
   echo "Starting Gitea restore..."
 
@@ -196,6 +228,12 @@ restore() {
   echo "Extracting archive..."
   tar -xzf "${BACKUP_FILE}" -C /tmp
 
+  restore_failed=0
+  created_count=0
+  skipped_count=0
+  overwritten_count=0
+  failed_count=0
+
   # Recreate users
   if [ -f "${META_DIR}/users.json" ]; then
     echo "Recreating users..."
@@ -205,9 +243,17 @@ restore() {
       email=$(jq -r ".[$i].email" "${META_DIR}/users.json")
       full_name=$(jq -r ".[$i].full_name // \"\"" "${META_DIR}/users.json")
 
+      # The built-in user is only skipped when it already exists on the target.
+      # A target whose admin has another name lacks it, and every
+      # platform-created repo is owned by it.
       if [ "$username" = "oscadmin" ]; then
-        echo "Skipping built-in user: ${username}"
-        continue
+        exists_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer ${GITEA_TOKEN}" \
+          "${GITEA_URL}/api/v1/users/${username}")
+        if [ "$exists_code" = "200" ]; then
+          echo "Skipping built-in user: ${username}"
+          continue
+        fi
       fi
 
       echo "Creating user: ${username}"
@@ -230,15 +276,15 @@ restore() {
       if [ "$http_code" = "422" ] || [ "$http_code" = "409" ]; then
         echo "User ${username} already exists, skipping"
       elif [ "$http_code" != "201" ]; then
-        echo "WARNING: Failed to create user ${username} (HTTP ${http_code}), skipping"
+        echo "ERROR: Failed to create user ${username} (HTTP ${http_code})"
+        restore_failed=1
       fi
     done
   fi
 
   # Restore repos from mirrors
   echo "Restoring repositories..."
-  find "${REPOS_DIR}" -name "*.git" -type d | while read -r mirror_path; do
-    # Derive owner and repo name from path
+  while read -r mirror_path; do
     # Path format: /tmp/repos/owner/repo.git
     relative="${mirror_path#${REPOS_DIR}/}"
     owner=$(dirname "$relative")
@@ -246,47 +292,86 @@ restore() {
 
     echo "Restoring repo: ${owner}/${repo}"
 
-    # Determine if this is an org repo or user repo
-    # Try to create under the owner; fall back to current user
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-      -X POST \
+    # Create the repo for its owner, never under the token owner.
+    # Org owners use the org endpoint, user owners the admin endpoint.
+    org_code=$(curl -s -o /dev/null -w "%{http_code}" \
       -H "Authorization: Bearer ${GITEA_TOKEN}" \
-      -H "Content-Type: application/json" \
-      "${GITEA_URL}/api/v1/org/${owner}/repos" \
-      -d "{
-        \"name\": \"${repo}\",
-        \"auto_init\": false,
-        \"private\": false
-      }")
+      "${GITEA_URL}/api/v1/orgs/${owner}")
+    if [ "$org_code" = "200" ]; then
+      create_url="${GITEA_URL}/api/v1/org/${owner}/repos"
+    else
+      create_url="${GITEA_URL}/api/v1/admin/users/${owner}/repos"
+    fi
 
-    if [ "$http_code" = "404" ]; then
-      # org not found, try user endpoint
+    # Probe the target first: a repo that already has content is never
+    # overwritten unless RESTORE_OVERWRITE_EXISTING=true.
+    decide_repo_action "${owner}" "${repo}"
+    if [ "$ACTION" = "create" ]; then
+      # Visibility comes from the backup metadata; anything unreadable means private.
+      meta_file="${REPOS_DIR}/${owner}/${repo}.meta.json"
+      repo_private=$(jq -r 'if (.private | type) == "boolean" then (.private | tostring) else "invalid" end' \
+        "${meta_file}" 2>/dev/null || true)
+      if [ "$repo_private" != "true" ] && [ "$repo_private" != "false" ]; then
+        echo "WARN: no visibility metadata for ${owner}/${repo}, creating it private"
+        repo_private=true
+      fi
       http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer ${GITEA_TOKEN}" \
         -H "Content-Type: application/json" \
-        "${GITEA_URL}/api/v1/user/repos" \
+        "${create_url}" \
         -d "{
           \"name\": \"${repo}\",
           \"auto_init\": false,
-          \"private\": false
-        }")
+          \"private\": ${repo_private}
+        }" || true)
+
+      if [ "$http_code" = "409" ]; then
+        # Created by someone else after our probe: decide again on the real state.
+        decide_repo_action "${owner}" "${repo}"
+        if [ "$ACTION" = "create" ]; then
+          echo "ERROR: ${owner}/${repo}: create returned 409 but the repo is still missing"
+          ACTION=fail
+        fi
+      elif [ "$http_code" != "201" ]; then
+        echo "ERROR: ${owner}/${repo}: failed to create repo (HTTP ${http_code})"
+        ACTION=fail
+      fi
     fi
 
-    if [ "$http_code" = "409" ] || [ "$http_code" = "422" ]; then
-      echo "Repo ${owner}/${repo} already exists, pushing anyway"
-    elif [ "$http_code" != "201" ]; then
-      echo "WARNING: Failed to create repo ${owner}/${repo} (HTTP ${http_code})"
-    fi
+    case "$ACTION" in
+      skip)
+        skipped_count=$((skipped_count + 1))
+        continue
+        ;;
+      fail)
+        failed_count=$((failed_count + 1))
+        restore_failed=1
+        continue
+        ;;
+    esac
 
     # Push mirror
-    (
-      cd "${mirror_path}"
-      git push --mirror \
-        "https://oscadmin:${GITEA_TOKEN}@${GITEA_HOST}/${owner}/${repo}.git" \
-        2>&1 || echo "WARNING: Failed to push mirror for ${owner}/${repo}"
-    )
-  done
+    if git -C "${mirror_path}" push --mirror \
+      "https://oscadmin:${GITEA_TOKEN}@${GITEA_HOST}/${owner}/${repo}.git" 2>&1; then
+      if [ "$ACTION" = "overwrite" ]; then
+        overwritten_count=$((overwritten_count + 1))
+      else
+        created_count=$((created_count + 1))
+      fi
+    else
+      echo "ERROR: ${owner}/${repo}: failed to push mirror"
+      failed_count=$((failed_count + 1))
+      restore_failed=1
+    fi
+  done < <(find "${REPOS_DIR}" -name "*.git" -type d)
+
+  echo "Restore summary: created=${created_count} skipped=${skipped_count} overwritten=${overwritten_count} failed=${failed_count}"
+
+  if [ "$restore_failed" -ne 0 ]; then
+    echo "ERROR: Restore finished with failures"
+    return 1
+  fi
 
   echo "Restore completed"
 }
